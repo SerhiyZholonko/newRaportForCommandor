@@ -761,10 +761,65 @@ function buildEnemyLossesReport(brData) {
 // ================================================================
 
 
-function buildKPSummary(sheetName, kpLabel) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var ws = ss.getSheetByName(sheetName);
+// ── Конфіг джерел КП ─────────────────────────────────────────────
+// Кожен КП: { sheet, dateCol, resultCol, sectorCol, sectors }
+//   dateCol/resultCol/sectorCol — 0-based індекси колонок.
+//   sectorCol=null    → весь аркуш = один КП (фільтр по сектору не потрібен).
+//   sectors           → токени, що мають міститись у колонці "Сектор" цього КП
+//                       (порівняння: без лапок, регістронезалежно, "містить").
+//
+// УВАГА: СОТА/АРКАН/ЕЛЕМЕНТ читаються з одного аркуша "Сота Лог"
+//   (дата = кол. N = 13, результат = кол. O = 14, сектор = кол. A = 0),
+//   розділяються за колонкою "Сектор". БРАМА лишається на своєму аркуші.
+//   ⚠️ Перевір рядок ЕЛЕМЕНТ: токен сектора "АТЛАС-16" — припущення.
+var KP_CONFIG = {
+  'СОТА':    { sheet: 'Сота Лог',    dateCol: 13, resultCol: 14, sectorCol: 0,    sectors: ['СОТА']     },
+  'АРКАН':   { sheet: 'Сота Лог',    dateCol: 13, resultCol: 14, sectorCol: 0,    sectors: ['АРКАН']    },
+  'ЕЛЕМЕНТ': { sheet: 'Сота Лог',    dateCol: 13, resultCol: 14, sectorCol: 0,    sectors: ['АТЛАС-16'] },
+  'БРАМА':   { sheet: 'Фільтер Брама', dateCol: 1, resultCol: 12, sectorCol: null, sectors: null        }
+};
 
+// Нормалізує значення сектора: прибирає лапки/nbsp, стискає пробіли, верхній регістр.
+function normalizeSector(v) {
+  return String(v || '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[«»""'']/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase();
+}
+
+// Робастний парсер дати/часу для аркушів КП.
+// Підтримує: Date-об'єкт; серійне число; "dd.MM.yyyy HH:mm:ss";
+//            "dd.MM.yyyy, HH:mm" (кома-роздільник, як у "Сота Лог"); лише дату.
+function parseKPDateTime(val) {
+  if (val === null || val === undefined || val === '') return null;
+  if (val instanceof Date) return isNaN(val.getTime()) ? null : val;
+  if (typeof val === 'number') {
+    if (val > 1 && val < 100000) return new Date(Math.round((val - 25569) * 86400 * 1000));
+    return null;
+  }
+  var s = String(val).trim();
+  var m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:[,\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+  if (m) return new Date(+m[3], +m[2] - 1, +m[1], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0));
+  var d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// Класифікує значення результату КП.
+// "loss"   — борт втрачено; "kill" — ураження; "failed" — не уражено;
+// "other"  — інше (напр. "Успішне патрулювання") → рахується як виліт, але
+//            не входить в ураження/втрати/неуспішно.
+function classifyKPResult(result) {
+  var s  = String(result || '').trim();
+  var up = s.toUpperCase();
+  if (up.indexOf('ВТРАЧЕНО') >= 0) return 'loss';
+  if (s === 'Знищено' || s === 'Уражено' || s === 'Пошкоджено' || s === 'Успішно') return 'kill';
+  if (up.indexOf('НЕ УРАЖЕНО') >= 0) return 'failed';
+  return 'other';
+}
+
+function buildKPSummary(kpLabel) {
   var items = [];
   function addLine(text, opts) {
     opts = opts || {};
@@ -772,6 +827,11 @@ function buildKPSummary(sheetName, kpLabel) {
                  italic: opts.italic || false, size: opts.size || null });
   }
 
+  var cfg = KP_CONFIG[kpLabel];
+  if (!cfg) return items;
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ws = ss.getSheetByName(cfg.sheet);
   if (!ws) return items;
 
   var now      = new Date();
@@ -783,43 +843,47 @@ function buildKPSummary(sheetName, kpLabel) {
   var fromTs = new Date(yest.getFullYear(), yest.getMonth(), yest.getDate(), 16, 0, 0).getTime();
   var toTs   = new Date(now.getFullYear(),  now.getMonth(),  now.getDate(),  16, 0, 0).getTime();
 
+  // Токени сектора (нормалізовані) — якщо кілька КП в одному аркуші
+  var sectorTokens = null;
+  if (cfg.sectorCol !== null && cfg.sectorCol !== undefined && cfg.sectors && cfg.sectors.length) {
+    sectorTokens = cfg.sectors.map(function(t) { return normalizeSector(t); });
+  }
+
   var data = ws.getDataRange().getValues();
 
-  var totalSorties = 0;
-  var totalKills   = 0;
-  var totalLosses  = 0;
-  var totalFailed  = 0;
+  var totalSorties = 0, totalKills = 0, totalLosses = 0, totalFailed = 0, totalOther = 0;
 
   for (var r = 0; r < data.length; r++) {
     var row = data[r];
-    var dt  = parseSotaDate(row[1]);
-    if (!dt) continue;
 
+    // Фільтр по сектору
+    if (sectorTokens) {
+      var sec = normalizeSector(row[cfg.sectorCol]);
+      var match = false;
+      for (var t = 0; t < sectorTokens.length; t++) {
+        if (sec.indexOf(sectorTokens[t]) >= 0) { match = true; break; }
+      }
+      if (!match) continue;
+    }
+
+    var dt = parseKPDateTime(row[cfg.dateCol]);
+    if (!dt) continue;
     var ts = dt.getTime();
     if (ts < fromTs || ts >= toTs) continue;
 
     totalSorties++;
 
-    var result = String(row[12] || '').trim();
-
-    if (result === 'Не уражено - Борт втрачено') {
-      totalLosses++;
-    } else if (result === 'Знищено' ||
-               result === 'Уражено' ||
-               result === 'Пошкоджено' ||
-               result === 'Успішно') {
-      totalKills++;
-    } else if (result.indexOf('Не уражено') >= 0) {
-      totalFailed++;
+    switch (classifyKPResult(row[cfg.resultCol])) {
+      case 'loss':   totalLosses++; break;
+      case 'kill':   totalKills++;  break;
+      case 'failed': totalFailed++; break;
+      default:       totalOther++;  break;   // "Успішне патрулювання" тощо
     }
   }
 
-  var fromLabel = yestStr  + ' 16:00:00';
-  var toLabel   = todayStr + ' 16:00:00';
-
   addLine('');
   addLine('КП ' + kpLabel, { bold: true });
-  addLine('За період ' + fromLabel + ' - ' + toLabel + ':');
+  addLine('За період ' + yestStr + ' 16:00:00 - ' + todayStr + ' 16:00:00:');
   addLine('');
   addLine('* Здійснили: вильотів - ' + totalSorties +
           ', уражень - ' + totalKills +
@@ -905,11 +969,11 @@ function formatReasons(reasonsMap) {
   }).join(', ');
 }
 
-function buildSotaKPSummary()    { return buildKPSummary('Фільтер Сота',    'СОТА');    }
-function buildBramaKPSummary()   { return buildKPSummary('Фільтер Брама',   'БРАМА');   }
-function buildElementKPSummary() { return buildKPSummary('Фільтер Елемент', 'ЕЛЕМЕНТ'); }
-function buildBastionKPSummary() { return buildKPSummary('Фільтер Бастіон', 'БАСТІОН'); }
-function buildArkanKPSummary()   { return buildKPSummary('Фільтер Аркан',   'АРКАН');   }
+function buildSotaKPSummary()    { return buildKPSummary('СОТА');    }
+function buildBramaKPSummary()   { return buildKPSummary('БРАМА');   }
+function buildElementKPSummary() { return buildKPSummary('ЕЛЕМЕНТ'); }
+function buildBastionKPSummary() { return buildKPSummary('БАСТІОН'); }
+function buildArkanKPSummary()   { return buildKPSummary('АРКАН');   }
 
 function parseSotaDate(val) {
   if (val === null || val === undefined || val === '') return null;
@@ -929,7 +993,7 @@ function parseSotaDate(val) {
 
 function debugKPSheets() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheets = ['Фільтер Сота', 'Фільтер Брама', 'Фільтер Елемент', 'Фільтер Бастіон', 'Фільтер Аркан'];
+  var sheets = ['Сота Лог', 'Брама лог', 'Фільтер Брама'];
 
   var debugWs = ss.getSheetByName('DEBUG КП');
   if (!debugWs) debugWs = ss.insertSheet('DEBUG КП');
@@ -2799,7 +2863,7 @@ function testKPLogic() {
 }
 
 function checkKPSummaryNow() {
-  var items = buildKPSummary('Фільтер Сота', 'СОТА');
+  var items = buildKPSummary('СОТА');
   var text = items.map(function(it) { return it.text; }).join('\n');
   Logger.log(text);
   SpreadsheetApp.getUi().alert(text);
