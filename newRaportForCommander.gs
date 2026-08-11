@@ -623,22 +623,35 @@ function buildBlock(label, planned, crewStats, plannedSet, lastAKCache,
 }
 
 // ── Підсумки по напрямкам ────────────────────────────────────────
+// Рахуємо з тих самих crewStats, що й блоки РОБОТА (не залежить від
+// реального дня — тягне ті самі дані, що й блоки).
+// Ітеруємо по ВСІХ розрахунках (planned + unplanned), тому незаплановані
+// теж враховуються, і "уражень" збігається з фактичними ураженнями.
+// Пошкоджено вже враховано в d.u (aggregateSorties рахує його як ураження).
+// Напрямок: resolveCrewAK (17 АК / 20 АК → Запорізький, решта → Харківський).
 function buildDirectionSummary(allStatsList, allPlannedList, lastAKCache, positionAKCache) {
   var zapV = 0, zapVt = 0, zapU = 0;
   var kharkV = 0, kharkVt = 0, kharkU = 0;
 
   for (var b = 0; b < allStatsList.length; b++) {
     var crewStats = allStatsList[b];
-    var planned   = allPlannedList[b];
 
+    // Позиція плану для розрахунку (щоб АК брався так само, як у рядках блоку)
+    var planPosByCrew = {};
+    var planned = allPlannedList[b] || [];
     for (var p = 0; p < planned.length; p++) {
-      var crew = planned[p].crew;
-      var d    = crewStats[crew];
-      // Та сама логіка, що й у рядках блоку (resolveCrewAK за позицією плану),
-      // щоб підсумки напрямків збігались з АК у рядках розрахунків.
-      var ak   = resolveCrewAK(planned[p].pos, crew, d, positionAKCache, lastAKCache);
-      if (!d) d = { v: 0, u: 0, vt: 0 };
-      if (ak === '17 АК') {
+      planPosByCrew[planned[p].crew] = planned[p].pos;
+    }
+
+    for (var crew in crewStats) {
+      var d = crewStats[crew];
+      if (!d) continue;
+
+      // Позиція: з плану (якщо є) → інакше фактична позиція вильоту
+      var pos = planPosByCrew[crew] || d.pos;
+      var ak  = resolveCrewAK(pos, crew, d, positionAKCache, lastAKCache);
+
+      if (ak === '17 АК' || ak === '20 АК') {
         zapV  += d.v;
         zapVt += d.vt;
         zapU  += d.u;
@@ -710,6 +723,8 @@ function buildEnemyLossesReport(brData) {
       dir = 'Харківський';
     }
 
+    // Пошкоджено — окремий облік (у переліку йде рядком "Пошкоджено"),
+    // але в сумі уражень по напрямках воно теж рахується (див. buildDirectionSummary).
     if (res === 'Знищено' || res === 'Успішно') {
       destroyed[dir][tgt] = (destroyed[dir][tgt] || 0) + 1;
     } else if (res === 'Пошкоджено') {
